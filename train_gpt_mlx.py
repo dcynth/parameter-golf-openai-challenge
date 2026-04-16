@@ -80,6 +80,10 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    ssm_d_state: int = int(os.environ.get("SSM_D_STATE", 512))
+    ssm_layers: tuple[int, ...] = tuple(
+        int(x) for x in os.environ.get("SSM_LAYERS", "3,4,5").split(",") if x
+    )
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -379,6 +383,58 @@ class Block(nn.Module):
         return x
 
 
+class SSMBlock(nn.Module):
+    """
+    Diagonal linear recurrence with gated output (LRU-style).
+    Replaces CausalSelfAttention in middle layers for longer-range mixing.
+    - Fully parallelizable via scaled causal cumsum (no sequential loop)
+    - GPTQ-compatible: all weight ops are nn.Linear
+    - Same (x, x0) -> x interface as Block
+    """
+    def __init__(self, dim: int, mlp_mult: int, d_state: int = 512):
+        super().__init__()
+        self.d_state = d_state
+        # Projects input to (ssm_input, gate) pair
+        self.in_proj = CastedLinear(dim, d_state * 2)
+        # Projects state back to residual stream
+        self.out_proj = CastedLinear(d_state, dim)
+        # Learnable log-decay: sigmoid(3.9) ≈ 0.98, ~50-step effective memory
+        self.log_a = mx.full((d_state,), 3.9, dtype=mx.float32)
+        self.ssm_norm = RMSNormNoWeight()
+        self.mlp_norm = RMSNormNoWeight()
+        self.mlp = MLP(dim, mlp_mult)
+        self.ssm_scale = mx.ones((dim,), dtype=mx.float32)
+        self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
+        self.resid_mix = mx.array(np.stack((
+            np.ones((dim,), dtype=np.float32),
+            np.zeros((dim,), dtype=np.float32),
+        )))
+
+    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
+        mix = self.resid_mix.astype(x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+
+        B, T, _ = x.shape
+        xz = self.in_proj(self.ssm_norm(x))                          # [B, T, 2*d_state]
+        xi, gate = xz[..., :self.d_state], xz[..., self.d_state:]
+
+        # Normalized diagonal recurrence (EMA-style): h_t = a*h_{t-1} + (1-a)*xi_t
+        # Equivalent: h_t = (1-a) * decay[t] * cumsum(xi_s * inv_decay[s], s<=t)
+        # Computed in float32 to avoid bfloat16 overflow at long sequence lengths.
+        a = mx.sigmoid(self.log_a).astype(mx.float32)                # [d_state]
+        log_a_safe = mx.log(mx.clip(a, 1e-3, 1.0 - 1e-6))           # [d_state]
+        t_idx = mx.arange(T, dtype=mx.float32)                       # [T]
+        decay     = mx.exp( t_idx[:, None] * log_a_safe[None, :])    # [T, d_state] float32
+        inv_decay = mx.exp(-t_idx[:, None] * log_a_safe[None, :])    # [T, d_state] float32
+        h = (1.0 - a) * mx.cumsum(xi.astype(mx.float32) * inv_decay[None], axis=1) * decay[None]
+        h = h.astype(xi.dtype) * mx.sigmoid(gate).astype(xi.dtype)   # gate and cast back
+        ssm_out = self.out_proj(h)
+
+        x = x + self.ssm_scale.astype(x.dtype)[None, None, :] * ssm_out
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        return x
+
+
 class GPT(nn.Module):
     # - token embedding + RMSNorm
     # - encoder half accumulates skip tensors
@@ -386,7 +442,7 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, ssm_d_state: int, ssm_layers: tuple[int, ...]):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -398,14 +454,19 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+        ssm_layer_set = set(ssm_layers)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            SSMBlock(dim, mlp_mult, d_state=ssm_d_state) if i in ssm_layer_set
+            else Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
-            b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
+            if hasattr(b, 'attn'):
+                b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
+            else:
+                b.out_proj.weight = mx.zeros_like(b.out_proj.weight)
             b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
@@ -897,6 +958,8 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        ssm_d_state=args.ssm_d_state,
+        ssm_layers=args.ssm_layers,
     )
     opt = SplitOptimizers(model, args)
 
@@ -951,11 +1014,13 @@ def main() -> None:
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
+    first_transformer = next(b for b in model.blocks if hasattr(b, 'attn'))
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
-        f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
+        f"linear_weight:{first_transformer.attn.c_q.weight.dtype} "
         f"skip_weights:{model.skip_weights.dtype}"
     )
+    log(f"ssm_layers:{list(args.ssm_layers)} ssm_d_state:{args.ssm_d_state}")
 
     # ==============================================================================
     # TRAINING LOOP

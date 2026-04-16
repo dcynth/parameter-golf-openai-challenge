@@ -58,6 +58,10 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    ssm_d_state = int(os.environ.get("SSM_D_STATE", 512))
+    ssm_layers = tuple(
+        int(x) for x in os.environ.get("SSM_LAYERS", "3,4,5").split(",") if x
+    )
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -645,6 +649,52 @@ class Block(nn.Module):
         return x
 
 
+class SSMBlock(nn.Module):
+    """
+    Diagonal linear recurrence with gated output (LRU-style).
+    Replaces CausalSelfAttention in middle layers for longer-range mixing.
+    - Fully parallelizable via scaled causal cumsum (no sequential loop)
+    - GPTQ-compatible: all weight ops are nn.Linear
+    - Same (x, x0) -> x interface as Block
+    """
+    def __init__(self, dim: int, mlp_mult: int, d_state: int = 512):
+        super().__init__()
+        self.d_state = d_state
+        self.in_proj = CastedLinear(dim, d_state * 2, bias=False)
+        self.out_proj = CastedLinear(d_state, dim, bias=False)
+        self.out_proj._zero_init = True
+        self.log_a = nn.Parameter(torch.full((d_state,), 3.9, dtype=torch.float32))
+        self.ssm_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
+        self.mlp = MLP(dim, mlp_mult)
+        self.ssm_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+
+        B, T, _ = x.shape
+        xz = self.in_proj(self.ssm_norm(x))                           # [B, T, 2*d_state]
+        xi, gate = xz[..., :self.d_state], xz[..., self.d_state:]
+
+        # Normalized diagonal recurrence (EMA-style): h_t = a*h_{t-1} + (1-a)*xi_t
+        # Parallelized via scaled causal cumsum. Float32 to avoid bf16 overflow.
+        a = torch.sigmoid(self.log_a).float()                          # [d_state]
+        log_a_safe = torch.log(a.clamp(1e-3, 1.0 - 1e-6))            # [d_state]
+        t_idx = torch.arange(T, device=x.device, dtype=torch.float32) # [T]
+        decay     = torch.exp( t_idx[:, None] * log_a_safe[None, :])  # [T, d_state]
+        inv_decay = torch.exp(-t_idx[:, None] * log_a_safe[None, :])  # [T, d_state]
+        h = (1.0 - a) * torch.cumsum(xi.float() * inv_decay[None], dim=1) * decay[None]
+        h = h.to(xi.dtype) * torch.sigmoid(gate).to(xi.dtype)
+        ssm_out = self.out_proj(h)
+
+        x = x + self.ssm_scale.to(dtype=x.dtype)[None, None, :] * ssm_out
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        return x
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -659,6 +709,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        ssm_d_state: int = 512,
+        ssm_layers: tuple[int, ...] = (),
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -671,16 +723,11 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        ssm_layer_set = set(ssm_layers)
         self.blocks = nn.ModuleList(
             [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
+                SSMBlock(model_dim, mlp_mult, d_state=ssm_d_state) if i in ssm_layer_set
+                else Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
                 for i in range(num_layers)
             ]
         )
@@ -835,6 +882,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        ssm_d_state=args.ssm_d_state,
+        ssm_layers=args.ssm_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -908,6 +957,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"ssm_layers:{list(args.ssm_layers)} ssm_d_state:{args.ssm_d_state}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
