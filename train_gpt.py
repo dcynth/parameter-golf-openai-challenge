@@ -682,10 +682,12 @@ class SSMBlock(nn.Module):
         # Normalized diagonal recurrence (EMA-style): h_t = a*h_{t-1} + (1-a)*xi_t
         # Parallelized via scaled causal cumsum. Float32 to avoid bf16 overflow.
         a = torch.sigmoid(self.log_a).float()                          # [d_state]
-        log_a_safe = torch.log(a.clamp(1e-3, 1.0 - 1e-6))            # [d_state]
+        log_a_safe = torch.log(a.clamp(min=1e-6))                      # [d_state], <= 0
         t_idx = torch.arange(T, device=x.device, dtype=torch.float32) # [T]
-        decay     = torch.exp( t_idx[:, None] * log_a_safe[None, :])  # [T, d_state]
-        inv_decay = torch.exp(-t_idx[:, None] * log_a_safe[None, :])  # [T, d_state]
+        log_decay = t_idx[:, None] * log_a_safe[None, :]               # [T, d_state], <= 0
+        log_decay = log_decay.clamp(min=-40.0)                         # prevent inv_decay overflow
+        decay     = torch.exp(log_decay)                               # [T, d_state]
+        inv_decay = torch.exp(-log_decay)                              # [T, d_state], <= exp(40)
         h = (1.0 - a) * torch.cumsum(xi.float() * inv_decay[None], dim=1) * decay[None]
         h = h.to(xi.dtype) * torch.sigmoid(gate).to(xi.dtype)
         ssm_out = self.out_proj(h)

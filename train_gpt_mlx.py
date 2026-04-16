@@ -422,10 +422,12 @@ class SSMBlock(nn.Module):
         # Equivalent: h_t = (1-a) * decay[t] * cumsum(xi_s * inv_decay[s], s<=t)
         # Computed in float32 to avoid bfloat16 overflow at long sequence lengths.
         a = mx.sigmoid(self.log_a).astype(mx.float32)                # [d_state]
-        log_a_safe = mx.log(mx.clip(a, 1e-3, 1.0 - 1e-6))           # [d_state]
+        log_a_safe = mx.log(mx.clip(a, 1e-6, 1.0))                   # [d_state], <= 0
         t_idx = mx.arange(T, dtype=mx.float32)                       # [T]
-        decay     = mx.exp( t_idx[:, None] * log_a_safe[None, :])    # [T, d_state] float32
-        inv_decay = mx.exp(-t_idx[:, None] * log_a_safe[None, :])    # [T, d_state] float32
+        log_decay = t_idx[:, None] * log_a_safe[None, :]              # [T, d_state], <= 0
+        log_decay = mx.clip(log_decay, -40.0, 0.0)                   # prevent inv_decay overflow
+        decay     = mx.exp(log_decay)                                 # [T, d_state] float32
+        inv_decay = mx.exp(-log_decay)                                # [T, d_state], <= exp(40)
         h = (1.0 - a) * mx.cumsum(xi.astype(mx.float32) * inv_decay[None], axis=1) * decay[None]
         h = h.astype(xi.dtype) * mx.sigmoid(gate).astype(xi.dtype)   # gate and cast back
         ssm_out = self.out_proj(h)
