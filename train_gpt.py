@@ -62,6 +62,10 @@ class Hyperparameters:
     ssm_layers = tuple(
         int(x) for x in os.environ.get("SSM_LAYERS", "3,4,5").split(",") if x
     )
+    recur_layers = tuple(
+        int(x) for x in os.environ.get("RECUR_LAYERS", "").split(",") if x
+    )
+    recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -715,6 +719,7 @@ class GPT(nn.Module):
         qk_gain_init: float,
         ssm_d_state: int = 512,
         ssm_layers: tuple[int, ...] = (),
+        recur_layers: tuple[int, ...] = (),
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -739,6 +744,10 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        # Depth recurrence: re-run these layers a second time when recur_active=True.
+        self.recur_layers_sorted = sorted(recur_layers)
+        self.recur_end = max(recur_layers) if recur_layers else -1
+        self.recur_active = False
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -761,7 +770,11 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            layer_idx = self.num_encoder_layers + i
+            x = self.blocks[layer_idx](x, x0)
+            if self.recur_active and layer_idx == self.recur_end:
+                for recur_idx in self.recur_layers_sorted:
+                    x = self.blocks[recur_idx](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -888,6 +901,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         ssm_d_state=args.ssm_d_state,
         ssm_layers=args.ssm_layers,
+        recur_layers=args.recur_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -962,6 +976,7 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
     log0(f"ssm_layers:{list(args.ssm_layers)} ssm_d_state:{args.ssm_d_state}")
+    log0(f"recur_layers:{list(args.recur_layers)} recur_start_step:{args.recur_start_step}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1088,6 +1103,9 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        if args.recur_layers and not base_model.recur_active and step >= args.recur_start_step:
+            base_model.recur_active = True
+            log0(f"recurrence_activated step:{step} layers:{list(args.recur_layers)}")
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
