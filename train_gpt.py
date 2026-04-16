@@ -57,7 +57,7 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 4.0))
     ssm_d_state = int(os.environ.get("SSM_D_STATE", 512))
     ssm_layers = tuple(
         int(x) for x in os.environ.get("SSM_LAYERS", "3,4,5").split(",") if x
