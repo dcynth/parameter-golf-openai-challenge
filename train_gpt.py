@@ -85,8 +85,6 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    muon_wd = float(os.environ.get("MUON_WD", 0.090))
-    embed_wd = float(os.environ.get("EMBED_WD", 0.090))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -118,10 +116,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, weight_decay: float = 0.0):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
 
     @torch.no_grad()
@@ -167,12 +165,9 @@ class Muon(torch.optim.Optimizer):
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
-            weight_decay = group["weight_decay"]
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                if weight_decay != 0.0:
-                    p.mul_(1.0 - lr * weight_decay)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
@@ -924,7 +919,6 @@ def main() -> None:
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
-        weight_decay=args.embed_wd,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -932,7 +926,6 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
-        weight_decay=args.muon_wd,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
