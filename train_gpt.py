@@ -67,6 +67,7 @@ class Hyperparameters:
     )
     recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
     parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", 999))
+    use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "0")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -615,15 +616,24 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, swiglu: bool = False):
         super().__init__()
-        hidden = mlp_mult * dim
+        if swiglu:
+            # Reduce hidden to keep param count ≈ same as relu² MLP:
+            # relu² uses 2×(dim×hidden); SwiGLU uses 3×(dim×hidden_g) -> hidden_g = 2/3 × hidden
+            hidden = round(mlp_mult * dim * 2 / 3 / 64) * 64
+            self.gate = CastedLinear(dim, hidden, bias=False)
+        else:
+            hidden = mlp_mult * dim
+            self.gate = None
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.swiglu = swiglu
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.swiglu:
+            return self.proj(F.silu(self.fc(x)) * self.gate(x))
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
@@ -637,12 +647,13 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        swiglu: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, swiglu=swiglu)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -673,12 +684,13 @@ class ParallelResidualBlock(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        swiglu: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, swiglu=swiglu)
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         # Cross-stream routing weights; diagonal init keeps streams independent at start
         self.attn_to_attn = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -706,7 +718,7 @@ class SSMBlock(nn.Module):
     - GPTQ-compatible: all weight ops are nn.Linear
     - Same (x, x0) -> x interface as Block
     """
-    def __init__(self, dim: int, mlp_mult: int, d_state: int = 512):
+    def __init__(self, dim: int, mlp_mult: int, d_state: int = 512, swiglu: bool = False):
         super().__init__()
         self.d_state = d_state
         self.in_proj = CastedLinear(dim, d_state * 2, bias=False)
@@ -715,7 +727,7 @@ class SSMBlock(nn.Module):
         self.log_a = nn.Parameter(torch.full((d_state,), 3.9, dtype=torch.float32))
         self.ssm_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, swiglu=swiglu)
         self.ssm_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -764,6 +776,7 @@ class GPT(nn.Module):
         ssm_layers: tuple[int, ...] = (),
         recur_layers: tuple[int, ...] = (),
         parallel_start_layer: int = 999,
+        use_swiglu: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -784,12 +797,14 @@ class GPT(nn.Module):
         )
         def _make_block(i: int) -> nn.Module:
             if i in ssm_layer_set:
-                return SSMBlock(model_dim, mlp_mult, d_state=ssm_d_state)
+                return SSMBlock(model_dim, mlp_mult, d_state=ssm_d_state, swiglu=use_swiglu)
             if i >= parallel_start_layer:
                 return ParallelResidualBlock(
-                    model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init
+                    model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                    swiglu=use_swiglu,
                 )
-            return Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            return Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                         swiglu=use_swiglu)
         self.blocks = nn.ModuleList([_make_block(i) for i in range(num_layers)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -968,6 +983,7 @@ def main() -> None:
         ssm_layers=args.ssm_layers,
         recur_layers=args.recur_layers,
         parallel_start_layer=args.parallel_start_layer,
+        use_swiglu=args.use_swiglu,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1044,6 +1060,7 @@ def main() -> None:
     log0(f"ssm_layers:{list(args.ssm_layers)} ssm_d_state:{args.ssm_d_state}")
     log0(f"recur_layers:{list(args.recur_layers)} recur_start_step:{args.recur_start_step}")
     log0(f"parallel_start_layer:{args.parallel_start_layer} parallel_start_local:{base_model._parallel_start_local}")
+    log0(f"use_swiglu:{args.use_swiglu}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
