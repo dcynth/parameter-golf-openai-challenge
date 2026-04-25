@@ -66,6 +66,7 @@ class Hyperparameters:
         int(x) for x in os.environ.get("RECUR_LAYERS", "").split(",") if x
     )
     recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
+    parallel_start_layer = int(os.environ.get("PARALLEL_START_LAYER", 999))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -299,7 +300,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,attn_to_attn,attn_to_mlp,mlp_to_attn,mlp_to_mlp",
     ).split(",")
     if pattern
 )
@@ -655,6 +656,48 @@ class Block(nn.Module):
         return x
 
 
+class ParallelResidualBlock(nn.Module):
+    """
+    Parallel residual streams: splits into attention lane (x_a) and MLP lane (x_m).
+    Each sublayer reads from its own lane; outputs are cross-routed to both streams
+    via learned per-channel scale weights (initialized diagonal -- independent streams).
+    Zero parameter overhead vs Block since attn and MLP share the same total budget.
+    Streams merge as (x_a + x_m) / 2 after the last parallel layer.
+    NOTE: do not overlap with SSM layers or depth-recurrence recur_end.
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: int,
+        rope_base: float,
+        qk_gain_init: float,
+    ):
+        super().__init__()
+        self.attn_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp = MLP(dim, mlp_mult)
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # Cross-stream routing weights; diagonal init keeps streams independent at start
+        self.attn_to_attn = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.attn_to_mlp  = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        self.mlp_to_attn  = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        self.mlp_to_mlp   = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+
+    def forward(self, x_a: Tensor, x_m: Tensor, x0: Tensor) -> tuple[Tensor, Tensor]:
+        mix = self.resid_mix.to(dtype=x_a.dtype)
+        x_a = mix[0][None, None, :] * x_a + mix[1][None, None, :] * x0
+        attn_out = self.attn(self.attn_norm(x_a))
+        mlp_out  = self.mlp(self.mlp_norm(x_m))
+        new_x_a = x_a + self.attn_to_attn.to(x_a.dtype)[None, None, :] * attn_out \
+                      + self.mlp_to_attn.to(x_a.dtype)[None, None, :] * mlp_out
+        new_x_m = x_m + self.attn_to_mlp.to(x_m.dtype)[None, None, :] * attn_out \
+                      + self.mlp_to_mlp.to(x_m.dtype)[None, None, :] * mlp_out
+        return new_x_a, new_x_m
+
+
 class SSMBlock(nn.Module):
     """
     Diagonal linear recurrence with gated output (LRU-style).
@@ -720,6 +763,7 @@ class GPT(nn.Module):
         ssm_d_state: int = 512,
         ssm_layers: tuple[int, ...] = (),
         recur_layers: tuple[int, ...] = (),
+        parallel_start_layer: int = 999,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -733,13 +777,20 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         ssm_layer_set = set(ssm_layers)
-        self.blocks = nn.ModuleList(
-            [
-                SSMBlock(model_dim, mlp_mult, d_state=ssm_d_state) if i in ssm_layer_set
-                else Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-                for i in range(num_layers)
-            ]
+        # _parallel_start_local: decoder-local index at which parallel streams begin.
+        # Clamped to [0, num_decoder_layers] so default 999 = no parallel layers.
+        self._parallel_start_local = max(
+            0, min(parallel_start_layer - self.num_encoder_layers, self.num_decoder_layers)
         )
+        def _make_block(i: int) -> nn.Module:
+            if i in ssm_layer_set:
+                return SSMBlock(model_dim, mlp_mult, d_state=ssm_d_state)
+            if i >= parallel_start_layer:
+                return ParallelResidualBlock(
+                    model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init
+                )
+            return Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+        self.blocks = nn.ModuleList([_make_block(i) for i in range(num_layers)])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -767,7 +818,9 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
-        for i in range(self.num_decoder_layers):
+
+        # Standard decoder layers (before parallel start).
+        for i in range(self._parallel_start_local):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             layer_idx = self.num_encoder_layers + i
@@ -775,6 +828,18 @@ class GPT(nn.Module):
             if self.recur_active and layer_idx == self.recur_end:
                 for recur_idx in self.recur_layers_sorted:
                     x = self.blocks[recur_idx](x, x0)
+
+        # Parallel residual decoder layers: split into attention lane (x_a) and MLP lane (x_m).
+        # Activated only when PARALLEL_START_LAYER is set to a reachable layer index.
+        if self._parallel_start_local < self.num_decoder_layers:
+            x_a = x
+            x_m = x
+            for i in range(self._parallel_start_local, self.num_decoder_layers):
+                if skips:
+                    x_a = x_a + self.skip_weights[i].to(dtype=x_a.dtype)[None, None, :] * skips.pop()
+                layer_idx = self.num_encoder_layers + i
+                x_a, x_m = self.blocks[layer_idx](x_a, x_m, x0)
+            x = (x_a + x_m) * 0.5
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -902,6 +967,7 @@ def main() -> None:
         ssm_d_state=args.ssm_d_state,
         ssm_layers=args.ssm_layers,
         recur_layers=args.recur_layers,
+        parallel_start_layer=args.parallel_start_layer,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -977,6 +1043,7 @@ def main() -> None:
     log0(f"seed:{args.seed}")
     log0(f"ssm_layers:{list(args.ssm_layers)} ssm_d_state:{args.ssm_d_state}")
     log0(f"recur_layers:{list(args.recur_layers)} recur_start_step:{args.recur_start_step}")
+    log0(f"parallel_start_layer:{args.parallel_start_layer} parallel_start_local:{base_model._parallel_start_local}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
