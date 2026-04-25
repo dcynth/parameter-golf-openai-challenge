@@ -100,12 +100,15 @@ def copy_from_hf_cache(*, repo_id: str, remote_root: str, filename: str, destina
 
     source = cached_path.resolve(strict=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
+    if destination.exists() or destination.is_symlink():
         destination.unlink()
     try:
         os.link(source, destination)
     except OSError:
-        shutil.copy2(source, destination)
+        try:
+            os.symlink(source, destination)
+        except OSError:
+            shutil.copy2(source, destination)
     return True
 
 
